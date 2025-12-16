@@ -4,6 +4,12 @@ A demonstration tool for testing Raft consensus configurations, with focus on el
 
 ## Installation
 
+For dragonboat fork submodule 
+
+```bash
+git submodule update --init --recursive
+```
+
 ```bash
 cd raft-demo
 go mod init raft-demo
