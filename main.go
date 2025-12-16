@@ -9,10 +9,12 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"math"
 	"math/rand"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -99,8 +101,128 @@ type Metrics struct {
 
 	// Election timing
 	lastLeaderLostTime time.Time       // When leader was lost (LeaderID became 0)
-	electionDurations  []time.Duration // How long each election took
+	electionDurations  []ElectionEvent // How long each election took
 	currentLeaderID    uint64
+
+	// When we intentionally trigger an election (e.g. stop the leader), record
+	// the start time so re-election measurements include failure detection time.
+	forcedElectionStart  time.Time
+	forcedElectionReason string
+	forcedElectionLeader uint64
+}
+
+type ElectionEvent struct {
+	Label    string
+	Duration time.Duration
+}
+
+type DurationStats struct {
+	Count int
+	Min   time.Duration
+	Max   time.Duration
+	Avg   time.Duration
+	P50   time.Duration
+	P90   time.Duration
+	P99   time.Duration
+}
+
+func computeDurationStats(in []time.Duration) DurationStats {
+	if len(in) == 0 {
+		return DurationStats{}
+	}
+	ds := make([]time.Duration, len(in))
+	copy(ds, in)
+	sort.Slice(ds, func(i, j int) bool { return ds[i] < ds[j] })
+	min := ds[0]
+	max := ds[len(ds)-1]
+	var total time.Duration
+	for _, d := range ds {
+		total += d
+	}
+	avg := total / time.Duration(len(ds))
+	return DurationStats{
+		Count: len(ds),
+		Min:   min,
+		Max:   max,
+		Avg:   avg,
+		P50:   percentileNearestRank(ds, 0.50),
+		P90:   percentileNearestRank(ds, 0.90),
+		P99:   percentileNearestRank(ds, 0.99),
+	}
+}
+
+func percentileNearestRank(sorted []time.Duration, p float64) time.Duration {
+	if len(sorted) == 0 {
+		return 0
+	}
+	if p <= 0 {
+		return sorted[0]
+	}
+	if p >= 1 {
+		return sorted[len(sorted)-1]
+	}
+	// Nearest-rank definition: ceil(p*N)th element (1-indexed).
+	rank := int(math.Ceil(p*float64(len(sorted)))) - 1
+	if rank < 0 {
+		rank = 0
+	}
+	if rank >= len(sorted) {
+		rank = len(sorted) - 1
+	}
+	return sorted[rank]
+}
+
+func canonicalElectionLabel(label string) string {
+	switch {
+	case label == "initial":
+		return "initial"
+	case strings.HasPrefix(label, "stop leader"):
+		return "stop leader"
+	case strings.HasPrefix(label, "re-election (leader_lost->elected)"):
+		return "re-election (leader_lost->elected)"
+	case label == "":
+		return "unknown"
+	default:
+		return label
+	}
+}
+
+func groupElectionEvents(events []ElectionEvent) map[string][]time.Duration {
+	out := make(map[string][]time.Duration)
+	for _, e := range events {
+		k := canonicalElectionLabel(e.Label)
+		out[k] = append(out[k], e.Duration)
+	}
+	return out
+}
+
+func printElectionSummary(events []ElectionEvent) {
+	groups := groupElectionEvents(events)
+	if len(groups) == 0 {
+		fmt.Println("No elections recorded yet")
+		return
+	}
+	keys := make([]string, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	fmt.Println("\nBy type:")
+	fmt.Printf("  %-30s %5s %8s %8s %8s %8s %8s %8s\n", "type", "n", "min", "avg", "p50", "p90", "p99", "max")
+	for _, k := range keys {
+		s := computeDurationStats(groups[k])
+		fmt.Printf("  %-30s %5d %8d %8d %8d %8d %8d %8d\n",
+			k,
+			s.Count,
+			s.Min.Milliseconds(),
+			s.Avg.Milliseconds(),
+			s.P50.Milliseconds(),
+			s.P90.Milliseconds(),
+			s.P99.Milliseconds(),
+			s.Max.Milliseconds(),
+		)
+	}
 }
 
 func (m *Metrics) SetStartTime() {
@@ -125,6 +247,14 @@ func NewMetrics() *Metrics {
 	}
 }
 
+func (m *Metrics) StartForcedElection(reason string, leaderID uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.forcedElectionStart = time.Now()
+	m.forcedElectionReason = reason
+	m.forcedElectionLeader = leaderID
+}
+
 func (m *Metrics) RecordLeaderChange(info raftio.LeaderInfo) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -138,23 +268,48 @@ func (m *Metrics) RecordLeaderChange(info raftio.LeaderInfo) {
 		return
 	}
 
+	// If we intentionally triggered an election (e.g. killed the leader), record
+	// "stop leader -> new leader" duration. This is the apples-to-apples metric
+	// you usually care about for SLA, as it includes failure detection time.
+	if newLeader != 0 && !m.forcedElectionStart.IsZero() {
+		// Only record once, on the first elected leader after the trigger.
+		d := now.Sub(m.forcedElectionStart)
+		label := m.forcedElectionReason
+		if label == "" {
+			label = "forced"
+		}
+		if m.forcedElectionLeader != 0 {
+			label = fmt.Sprintf("%s (leader=%d)", label, m.forcedElectionLeader)
+		}
+		m.electionDurations = append(m.electionDurations, ElectionEvent{Label: label, Duration: d})
+		fmt.Printf(">>> FORCED RE-ELECTION COMPLETE: Node %d in %v\n", newLeader, d)
+		m.forcedElectionStart = time.Time{}
+		m.forcedElectionReason = ""
+		m.forcedElectionLeader = 0
+	}
+
 	// Track election timing
 	if prevLeader != 0 && newLeader == 0 {
-		// Leader lost - start timing (only if not already timing)
-		if m.lastLeaderLostTime.IsZero() {
+		// Leader lost - start timing (only if not already timing).
+		// If a forced election is active (e.g. we killed the leader), we avoid
+		// recording the "leader_lost->elected" metric because it excludes failure
+		// detection time and will look artificially tiny.
+		if m.forcedElectionStart.IsZero() && m.lastLeaderLostTime.IsZero() {
 			m.lastLeaderLostTime = now
 			fmt.Printf(">>> LEADER LOST at %s (was Node %d)\n", now.Format("15:04:05.000"), prevLeader)
 		}
 	} else if newLeader != 0 && !m.lastLeaderLostTime.IsZero() {
-		// New leader elected after loss - record duration
-		electionDuration := now.Sub(m.lastLeaderLostTime)
-		m.electionDurations = append(m.electionDurations, electionDuration)
-		fmt.Printf(">>> NEW LEADER ELECTED: Node %d in %v\n", newLeader, electionDuration)
+		// New leader elected after loss - record duration (only when not forced)
+		if m.forcedElectionStart.IsZero() {
+			electionDuration := now.Sub(m.lastLeaderLostTime)
+			m.electionDurations = append(m.electionDurations, ElectionEvent{Label: "re-election (leader_lost->elected)", Duration: electionDuration})
+			fmt.Printf(">>> NEW LEADER ELECTED: Node %d in %v\n", newLeader, electionDuration)
+		}
 		m.lastLeaderLostTime = time.Time{} // Reset
 	} else if prevLeader == 0 && newLeader != 0 && len(m.electionDurations) == 0 {
 		// Initial leader election (only record once)
 		electionDuration := now.Sub(m.startTime)
-		m.electionDurations = append(m.electionDurations, electionDuration)
+		m.electionDurations = append(m.electionDurations, ElectionEvent{Label: "initial", Duration: electionDuration})
 		fmt.Printf(">>> INITIAL LEADER: Node %d elected in %v\n", newLeader, electionDuration)
 	}
 
@@ -203,9 +358,10 @@ func (m *Metrics) GetStats() map[string]interface{} {
 	var avgElection, minElection, maxElection time.Duration
 	if len(m.electionDurations) > 0 {
 		var total time.Duration
-		minElection = m.electionDurations[0]
-		maxElection = m.electionDurations[0]
-		for _, d := range m.electionDurations {
+		minElection = m.electionDurations[0].Duration
+		maxElection = m.electionDurations[0].Duration
+		for _, e := range m.electionDurations {
+			d := e.Duration
 			total += d
 			if d < minElection {
 				minElection = d
@@ -235,10 +391,10 @@ func (m *Metrics) GetStats() map[string]interface{} {
 	}
 }
 
-func (m *Metrics) GetElectionDurations() []time.Duration {
+func (m *Metrics) GetElectionDurations() []ElectionEvent {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	result := make([]time.Duration, len(m.electionDurations))
+	result := make([]ElectionEvent, len(m.electionDurations))
 	copy(result, m.electionDurations)
 	return result
 }
@@ -469,7 +625,8 @@ func (c *DemoCluster) Start() error {
 		})
 	}
 
-	time.Sleep(5 * time.Second)
+	// Start timing initial election from when we begin starting replicas.
+	// (Previously this included an unrelated fixed sleep and skewed results.)
 	c.metrics.SetStartTime()
 
 	var wg errgroup.Group
@@ -599,15 +756,20 @@ func (c *DemoCluster) PrintStats() {
 		fmt.Printf("Max election time: %d ms\n", stats["election_max_ms"])
 
 		// Show individual election durations
-		durations := c.metrics.GetElectionDurations()
+		events := c.metrics.GetElectionDurations()
 		fmt.Printf("Individual elections: ")
-		for i, d := range durations {
+		for i, e := range events {
 			if i > 0 {
 				fmt.Printf(", ")
 			}
-			fmt.Printf("%dms", d.Milliseconds())
+			if e.Label != "" {
+				fmt.Printf("%s=%dms", e.Label, e.Duration.Milliseconds())
+			} else {
+				fmt.Printf("%dms", e.Duration.Milliseconds())
+			}
 		}
 		fmt.Println()
+		printElectionSummary(events)
 	}
 
 	if leaderID, term, ok := c.GetLeaderInfo(); ok {
@@ -640,6 +802,11 @@ func (c *DemoCluster) StopNode(nodeID int) error {
 	idx := nodeID - 1
 	if c.nodes[idx] == nil {
 		return fmt.Errorf("node %d already stopped", nodeID)
+	}
+
+	// If we're stopping the current leader, capture "stop -> new leader" timing.
+	if leaderID, _, ok := c.GetLeaderInfo(); ok && int(leaderID) == nodeID {
+		c.metrics.StartForcedElection("stop leader", leaderID)
 	}
 
 	c.nodes[idx].Close()
@@ -718,9 +885,11 @@ func runInteractiveMode(cluster *DemoCluster) {
 	fmt.Println("  history     - Show leader election history")
 	fmt.Println("  elections   - Show election timing stats")
 	fmt.Println("  stop <n>    - Stop node n (simulates failure)")
+	fmt.Println("  stop-leader - Stop the current leader (apples-to-apples re-election timing)")
 	fmt.Println("  start <n>   - Restart node n")
 	fmt.Println("  propose <v> - Propose value v")
 	fmt.Println("  workload    - Start continuous workload")
+	fmt.Println("  sleep <ms>  - Sleep for ms (useful to wait for re-election)")
 	fmt.Println("  quit        - Exit")
 	fmt.Println()
 
@@ -776,15 +945,16 @@ func runInteractiveMode(cluster *DemoCluster) {
 				fmt.Printf("Min: %d ms\n", stats["election_min_ms"])
 				fmt.Printf("Max: %d ms\n", stats["election_max_ms"])
 
-				durations := cluster.metrics.GetElectionDurations()
+				events := cluster.metrics.GetElectionDurations()
 				fmt.Println("\nIndividual election times:")
-				for i, d := range durations {
-					label := "initial"
-					if i > 0 {
-						label = fmt.Sprintf("re-election #%d", i)
+				for i, e := range events {
+					label := e.Label
+					if label == "" {
+						label = fmt.Sprintf("election #%d", i)
 					}
-					fmt.Printf("  %s: %v\n", label, d)
+					fmt.Printf("  %s: %v\n", label, e.Duration)
 				}
+				printElectionSummary(events)
 			} else {
 				fmt.Println("No elections recorded yet")
 			}
@@ -800,6 +970,16 @@ func runInteractiveMode(cluster *DemoCluster) {
 				continue
 			}
 			if err := cluster.StopNode(nodeID); err != nil {
+				fmt.Printf("Error: %v\n", err)
+			}
+
+		case "stop-leader", "stopleader", "killleader":
+			leaderID, _, ok := cluster.GetLeaderInfo()
+			if !ok || leaderID == 0 {
+				fmt.Println("No leader currently elected")
+				continue
+			}
+			if err := cluster.StopNode(int(leaderID)); err != nil {
 				fmt.Printf("Error: %v\n", err)
 			}
 
@@ -833,6 +1013,18 @@ func runInteractiveMode(cluster *DemoCluster) {
 			fmt.Println("Starting continuous workload...")
 			cluster.RunWorkload()
 
+		case "sleep", "wait":
+			if len(parts) < 2 {
+				fmt.Println("Usage: sleep <ms>")
+				continue
+			}
+			ms, err := strconv.Atoi(parts[1])
+			if err != nil || ms < 0 {
+				fmt.Printf("Invalid ms: %s\n", parts[1])
+				continue
+			}
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+
 		case "quit", "exit", "q":
 			fmt.Println("Shutting down...")
 			return
@@ -863,6 +1055,9 @@ func main() {
 	transportMaxDelayMs := flag.Uint64("transport-max-delay-ms", 0, "Transport delay in ms (for testing network issues)")
 	configFile := flag.String("config", "", "Load configuration from JSON file")
 	saveConfig := flag.String("save-config", "", "Save current configuration to JSON file")
+	trials := flag.Int("trials", 0, "Run N automated trials (start fresh cluster, measure initial election, stop leader, measure stop->new-leader)")
+	trialsVerbose := flag.Bool("trials-verbose", false, "Print per-trial results when using --trials")
+	trialsTimeoutMs := flag.Int("trials-timeout-ms", 10000, "Timeout per trial phase in ms (waiting for leader / waiting for re-election)")
 
 	flag.Parse()
 
@@ -918,8 +1113,15 @@ func main() {
 	}
 
 	// Create and start cluster
-	cluster := NewDemoCluster(cfg)
+	if *trials > 0 {
+		if err := runTrials(cfg, *trials, *trialsVerbose, time.Duration(*trialsTimeoutMs)*time.Millisecond); err != nil {
+			fmt.Printf("Trials failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
+	cluster := NewDemoCluster(cfg)
 	if err := cluster.Start(); err != nil {
 		fmt.Printf("Failed to start cluster: %v\n", err)
 		os.Exit(1)
@@ -953,6 +1155,157 @@ func main() {
 		cluster.PrintStats()
 		cluster.Stop()
 	}
+}
+
+func runTrials(cfg DemoConfig, trials int, verbose bool, phaseTimeout time.Duration) error {
+	if trials <= 0 {
+		return fmt.Errorf("trials must be > 0")
+	}
+	fmt.Printf("\n=== Trials Mode (%d trials) ===\n", trials)
+	fmt.Printf("Config: nodes=%d rtt=%dms electionRTT=%d heartbeatRTT=%d startupSpread=%dms prevote=%v checkQuorum=%v\n",
+		cfg.NodeCount, cfg.RTTMillisecond, cfg.ElectionRTT, cfg.HeartbeatRTT, cfg.StartupSpreadMs, cfg.PreVote, cfg.CheckQuorum)
+	fmt.Printf("Per-phase timeout: %v\n\n", phaseTimeout)
+
+	var initialAll []time.Duration
+	var stopAll []time.Duration
+	failures := 0
+
+	for i := 1; i <= trials; i++ {
+		// Isolate each trial so stale state doesn't leak across runs.
+		trialCfg := cfg
+		trialCfg.TestDurationSec = 0
+		trialCfg.DataDir = filepath.Join(os.TempDir(), fmt.Sprintf("raft-demo-trial-%d-%d", time.Now().UnixNano(), i))
+		trialCfg.BasePort = cfg.BasePort + i*100
+
+		cluster := NewDemoCluster(trialCfg)
+		if err := cluster.Start(); err != nil {
+			failures++
+			if verbose {
+				fmt.Printf("trial %d: start failed: %v\n", i, err)
+			}
+			continue
+		}
+
+		leaderID, leaderTerm, ok := waitForLeader(cluster, phaseTimeout)
+		if !ok {
+			failures++
+			if verbose {
+				fmt.Printf("trial %d: no leader within %v\n", i, phaseTimeout)
+			}
+			cluster.Stop()
+			continue
+		}
+
+		initial, ok := findElectionDuration(cluster.metrics.GetElectionDurations(), "initial")
+		if ok {
+			initialAll = append(initialAll, initial)
+		} else {
+			failures++
+			if verbose {
+				fmt.Printf("trial %d: missing initial election event\n", i)
+			}
+			cluster.Stop()
+			continue
+		}
+
+		// Force re-election by stopping the current leader.
+		if err := cluster.StopNode(int(leaderID)); err != nil {
+			failures++
+			if verbose {
+				fmt.Printf("trial %d: failed to stop leader %d: %v\n", i, leaderID, err)
+			}
+			cluster.Stop()
+			continue
+		}
+
+		stopDur, ok := waitForStopLeaderEvent(cluster, phaseTimeout)
+		if ok {
+			stopAll = append(stopAll, stopDur)
+		} else {
+			failures++
+			if verbose {
+				fmt.Printf("trial %d: no stop-leader re-election event within %v\n", i, phaseTimeout)
+			}
+			cluster.Stop()
+			continue
+		}
+
+		if verbose {
+			newLeaderID, newLeaderTerm, _ := cluster.GetLeaderInfo()
+			fmt.Printf("trial %d: initial=%dms leader=%d term=%d | stop->new=%dms newLeader=%d term=%d\n",
+				i,
+				initial.Milliseconds(),
+				leaderID,
+				leaderTerm,
+				stopDur.Milliseconds(),
+				newLeaderID,
+				newLeaderTerm,
+			)
+		}
+
+		cluster.Stop()
+	}
+
+	fmt.Printf("\n=== Trial Summary ===\n")
+	fmt.Printf("Completed: %d, failures: %d\n", trials-failures, failures)
+	fmt.Println("\nInitial election (start -> leader elected):")
+	printTrialStats(initialAll)
+	fmt.Println("\nStop-leader re-election (stop leader -> new leader elected):")
+	printTrialStats(stopAll)
+
+	return nil
+}
+
+func printTrialStats(ds []time.Duration) {
+	s := computeDurationStats(ds)
+	if s.Count == 0 {
+		fmt.Println("  no samples")
+		return
+	}
+	fmt.Printf("  n=%d min=%dms avg=%dms p50=%dms p90=%dms p99=%dms max=%dms\n",
+		s.Count,
+		s.Min.Milliseconds(),
+		s.Avg.Milliseconds(),
+		s.P50.Milliseconds(),
+		s.P90.Milliseconds(),
+		s.P99.Milliseconds(),
+		s.Max.Milliseconds(),
+	)
+}
+
+func waitForLeader(cluster *DemoCluster, timeout time.Duration) (leaderID uint64, term uint64, ok bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		lid, t, ok := cluster.GetLeaderInfo()
+		if ok && lid != 0 {
+			return lid, t, true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return 0, 0, false
+}
+
+func findElectionDuration(events []ElectionEvent, label string) (time.Duration, bool) {
+	for _, e := range events {
+		if e.Label == label {
+			return e.Duration, true
+		}
+	}
+	return 0, false
+}
+
+func waitForStopLeaderEvent(cluster *DemoCluster, timeout time.Duration) (time.Duration, bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		events := cluster.metrics.GetElectionDurations()
+		for _, e := range events {
+			if strings.HasPrefix(e.Label, "stop leader") {
+				return e.Duration, true
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return 0, false
 }
 
 type TransportFactory struct {
