@@ -970,8 +970,33 @@ type Connection struct {
 }
 
 func (c Connection) SendMessageBatch(batch raftpb.MessageBatch) error {
-	const minDelay = 25
-	time.Sleep(time.Duration(minDelay+rand.Intn(int(c.DelayMillisecond-minDelay))) * time.Millisecond)
+	// Allow DelayMillisecond=0 (default) and any small values without underflowing
+	// or passing a negative/zero argument to rand.Intn.
+	const minDelay uint64 = 25
+	if c.DelayMillisecond > 0 {
+		sleepMs := func(max uint64) time.Duration {
+			// rand.Intn panics for n <= 0, and its parameter is an int.
+			// We want uniform in [0, max] ms; implement that safely.
+			//
+			// Note: if max is extremely large (>> realistic ms values), we clamp to
+			// avoid int overflow, and accept that the distribution is truncated.
+			maxInt := uint64(^uint(0) >> 1) // math.MaxInt for the current arch
+			if max == 0 {
+				return 0
+			}
+			if max >= maxInt-1 {
+				// We can't call Intn(int(max)+1) when max == MaxInt (would overflow).
+				// Use a saturated bound of MaxInt-1 => Intn(MaxInt) is safe.
+				return time.Duration(rand.Intn(int(maxInt))) * time.Millisecond
+			}
+			return time.Duration(rand.Intn(int(max)+1)) * time.Millisecond
+		}
+		if c.DelayMillisecond >= minDelay {
+			time.Sleep(time.Duration(minDelay)*time.Millisecond + sleepMs(c.DelayMillisecond-minDelay))
+		} else {
+			time.Sleep(sleepMs(c.DelayMillisecond))
+		}
+	}
 	return c.IConnection.SendMessageBatch(batch)
 }
 
