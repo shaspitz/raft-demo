@@ -61,6 +61,17 @@ type DemoConfig struct {
 	// Each node starts with random delay in range [0, StartupSpreadMs)
 	StartupSpreadMs     int    `json:"startup_spread_ms"`
 	TransportMaxDelayMs uint64 `json:"transport_max_delay_ms"`
+
+	// Transport latency model (optional). When set, this overrides TransportMaxDelayMs.
+	//
+	// All values below are interpreted as RTT in milliseconds and converted to
+	// one-way delays internally (by dividing by 2) since we delay each send.
+	TransportLatencyPreset    string    `json:"transport_latency_preset"`
+	TransportLatencyValuesMs  []uint64  `json:"transport_latency_values_ms"`
+	TransportLatencyWeights   []float64 `json:"transport_latency_weights"`
+	TransportLatencyJitterMs  uint64    `json:"transport_latency_jitter_ms"`
+	TransportLatencySpikeMs   uint64    `json:"transport_latency_spike_ms"`
+	TransportLatencySpikeProb float64   `json:"transport_latency_spike_prob"`
 }
 
 // DefaultConfig returns sensible default configuration
@@ -82,6 +93,155 @@ func DefaultConfig() DemoConfig {
 		TestDurationSec:    60,
 		StartupSpreadMs:    0, // 0 = all nodes start simultaneously
 	}
+}
+
+type TransportLatencyModel struct {
+	// If preset is empty, this model is disabled.
+	preset string
+
+	// Discrete RTT distribution (ms). Sample values with weights.
+	valuesRTTms []uint64
+	weights     []float64
+	weightCDF   []float64
+
+	// Optional jitter applied to sampled RTT (ms). Applied symmetrically.
+	jitterRTTms uint64
+
+	// Optional spike applied to sampled RTT with probability (ms).
+	spikeRTTms uint64
+	spikeProb  float64
+}
+
+func (m *TransportLatencyModel) Enabled() bool {
+	return m != nil && (m.preset != "" || len(m.valuesRTTms) > 0)
+}
+
+func (m *TransportLatencyModel) SampleOneWayDelay() time.Duration {
+	// Returns one-way delay, as we apply delay to each send direction.
+	if m == nil {
+		return 0
+	}
+	rtt := m.sampleRTTms()
+	return time.Duration(rtt/2) * time.Millisecond
+}
+
+func (m *TransportLatencyModel) sampleRTTms() uint64 {
+	var base uint64
+
+	if len(m.valuesRTTms) > 0 {
+		base = m.sampleDiscreteRTTms()
+	}
+
+	// Jitter is applied symmetrically around base: base +/- jitter
+	if m.jitterRTTms > 0 {
+		j := int64(m.jitterRTTms)
+		delta := rand.Int63n(2*j+1) - j
+		// Clamp at 0.
+		if delta < 0 && uint64(-delta) > base {
+			base = 0
+		} else {
+			base = uint64(int64(base) + delta)
+		}
+	}
+
+	// Spike overrides base upward.
+	if m.spikeRTTms > 0 && m.spikeProb > 0 {
+		if rand.Float64() < m.spikeProb {
+			if m.spikeRTTms > base {
+				base = m.spikeRTTms
+			}
+		}
+	}
+
+	return base
+}
+
+func (m *TransportLatencyModel) sampleDiscreteRTTms() uint64 {
+	// Assumes weightCDF has been built.
+	if len(m.valuesRTTms) == 1 {
+		return m.valuesRTTms[0]
+	}
+	r := rand.Float64()
+	i := sort.SearchFloat64s(m.weightCDF, r)
+	if i < 0 {
+		i = 0
+	}
+	if i >= len(m.valuesRTTms) {
+		i = len(m.valuesRTTms) - 1
+	}
+	return m.valuesRTTms[i]
+}
+
+func buildTransportLatencyModel(cfg DemoConfig) (*TransportLatencyModel, error) {
+	// Presets are intentionally blunt — the goal is to approximate a fat-tailed RTT distribution.
+	switch strings.ToLower(strings.TrimSpace(cfg.TransportLatencyPreset)) {
+	case "":
+		// No preset; allow custom values below.
+	case "global-pessimistic":
+		// RTT ~200ms baseline, jitter ±30ms, occasional spikes to 350ms.
+		cfg.TransportLatencyValuesMs = []uint64{200}
+		cfg.TransportLatencyWeights = []float64{1.0}
+		cfg.TransportLatencyJitterMs = 30
+		cfg.TransportLatencySpikeMs = 350
+		cfg.TransportLatencySpikeProb = 0.05
+	case "global-measured":
+		// Sample RTT from {90,105,150,220,280,350} with a heavy-ish tail.
+		cfg.TransportLatencyValuesMs = []uint64{90, 105, 150, 220, 280, 350}
+		// More mass in the tail than a uniform distribution.
+		cfg.TransportLatencyWeights = []float64{0.10, 0.10, 0.18, 0.22, 0.25, 0.15}
+	case "latency-aware":
+		// Latency-clustered election set (multi-DC but not worldwide scatter).
+		cfg.TransportLatencyValuesMs = []uint64{50, 70, 90}
+		cfg.TransportLatencyWeights = []float64{0.34, 0.33, 0.33}
+	default:
+		return nil, fmt.Errorf("unknown --latency-preset %q", cfg.TransportLatencyPreset)
+	}
+
+	if len(cfg.TransportLatencyValuesMs) == 0 {
+		// Model disabled unless values provided.
+		return nil, nil
+	}
+	if len(cfg.TransportLatencyWeights) != 0 && len(cfg.TransportLatencyWeights) != len(cfg.TransportLatencyValuesMs) {
+		return nil, fmt.Errorf("transport latency weights length (%d) must match values length (%d)", len(cfg.TransportLatencyWeights), len(cfg.TransportLatencyValuesMs))
+	}
+
+	weights := cfg.TransportLatencyWeights
+	if len(weights) == 0 {
+		weights = make([]float64, len(cfg.TransportLatencyValuesMs))
+		for i := range weights {
+			weights[i] = 1.0
+		}
+	}
+
+	// Normalize + build CDF.
+	var sum float64
+	for _, w := range weights {
+		if w < 0 {
+			return nil, fmt.Errorf("transport latency weights must be non-negative")
+		}
+		sum += w
+	}
+	if sum == 0 {
+		return nil, fmt.Errorf("transport latency weights sum to 0")
+	}
+	cdf := make([]float64, len(weights))
+	var acc float64
+	for i, w := range weights {
+		acc += w / sum
+		cdf[i] = acc
+	}
+	// Ensure last element is exactly 1.0 for SearchFloat64s edge cases.
+	cdf[len(cdf)-1] = 1.0
+
+	return &TransportLatencyModel{
+		preset:      cfg.TransportLatencyPreset,
+		valuesRTTms: cfg.TransportLatencyValuesMs,
+		weights:     weights,
+		weightCDF:   cdf,
+		jitterRTTms: cfg.TransportLatencyJitterMs,
+		spikeRTTms:  cfg.TransportLatencySpikeMs,
+		spikeProb:   cfg.TransportLatencySpikeProb,
+	}, nil
 }
 
 // Metrics tracks cluster behavior
@@ -530,6 +690,11 @@ func (c *DemoCluster) Start() error {
 	// Clean up previous data
 	os.RemoveAll(c.config.DataDir)
 
+	latencyModel, err := buildTransportLatencyModel(c.config)
+	if err != nil {
+		return err
+	}
+
 	// Build initial members map
 	initialMembers := make(map[uint64]string)
 	for i := 1; i <= c.config.NodeCount; i++ {
@@ -585,7 +750,10 @@ func (c *DemoCluster) Start() error {
 				nodeID:  replicaID,
 			},
 		}
-		nhc.Expert.TransportFactory = &TransportFactory{DelayMillisecond: c.config.TransportMaxDelayMs}
+		nhc.Expert.TransportFactory = &TransportFactory{
+			DelayMillisecond: c.config.TransportMaxDelayMs,
+			LatencyModel:     latencyModel,
+		}
 
 		nh, err := dragonboat.NewNodeHost(nhc)
 		if err != nil {
@@ -633,7 +801,7 @@ func (c *DemoCluster) Start() error {
 	for _, start := range starts {
 		wg.Go(start)
 	}
-	err := wg.Wait()
+	err = wg.Wait()
 	if err != nil {
 		return err
 	}
@@ -1053,6 +1221,12 @@ func main() {
 	duration := flag.Int("duration", 0, "Test duration in seconds (0 for interactive)")
 	startupSpread := flag.Int("startup-spread", 0, "Max random startup delay per node in ms (simulates block propagation)")
 	transportMaxDelayMs := flag.Uint64("transport-max-delay-ms", 0, "Transport delay in ms (for testing network issues)")
+	latencyPreset := flag.String("latency-preset", "", "Transport latency preset (models RTT distribution): global-pessimistic | global-measured | latency-aware")
+	latencyValues := flag.String("latency-values-ms", "", "Custom RTT samples in ms (comma-separated), used when --latency-preset is empty")
+	latencyWeights := flag.String("latency-weights", "", "Optional weights for --latency-values-ms (comma-separated, same length)")
+	latencyJitter := flag.Uint64("latency-jitter-ms", 0, "Optional symmetric RTT jitter (ms) applied to sampled RTT")
+	latencySpikeMs := flag.Uint64("latency-spike-ms", 0, "Optional RTT spike value (ms) applied with probability --latency-spike-prob")
+	latencySpikeProb := flag.Float64("latency-spike-prob", 0, "Probability of RTT spike (0..1)")
 	configFile := flag.String("config", "", "Load configuration from JSON file")
 	saveConfig := flag.String("save-config", "", "Save current configuration to JSON file")
 	trials := flag.Int("trials", 0, "Run N automated trials (start fresh cluster, measure initial election, stop leader, measure stop->new-leader)")
@@ -1091,6 +1265,28 @@ func main() {
 	cfg.TestDurationSec = *duration
 	cfg.StartupSpreadMs = *startupSpread
 	cfg.TransportMaxDelayMs = *transportMaxDelayMs
+	cfg.TransportLatencyPreset = *latencyPreset
+	cfg.TransportLatencyJitterMs = *latencyJitter
+	cfg.TransportLatencySpikeMs = *latencySpikeMs
+	cfg.TransportLatencySpikeProb = *latencySpikeProb
+
+	// Parse custom RTT distribution values/weights if provided.
+	if strings.TrimSpace(*latencyValues) != "" {
+		vals, err := parseCSVUint64(*latencyValues)
+		if err != nil {
+			fmt.Printf("Invalid --latency-values-ms: %v\n", err)
+			os.Exit(1)
+		}
+		cfg.TransportLatencyValuesMs = vals
+	}
+	if strings.TrimSpace(*latencyWeights) != "" {
+		ws, err := parseCSVFloat64(*latencyWeights)
+		if err != nil {
+			fmt.Printf("Invalid --latency-weights: %v\n", err)
+			os.Exit(1)
+		}
+		cfg.TransportLatencyWeights = ws
+	}
 
 	// Validate configuration
 	if cfg.ElectionRTT <= 2*cfg.HeartbeatRTT {
@@ -1256,6 +1452,49 @@ func runTrials(cfg DemoConfig, trials int, verbose bool, phaseTimeout time.Durat
 	return nil
 }
 
+func parseCSVUint64(s string) ([]uint64, error) {
+	parts := strings.Split(s, ",")
+	out := make([]uint64, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		v, err := strconv.ParseUint(p, 10, 64)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no values")
+	}
+	return out, nil
+}
+
+func parseCSVFloat64(s string) ([]float64, error) {
+	parts := strings.Split(s, ",")
+	out := make([]float64, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		v, err := strconv.ParseFloat(p, 64)
+		if err != nil {
+			return nil, err
+		}
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return nil, fmt.Errorf("invalid float %q", p)
+		}
+		out = append(out, v)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no values")
+	}
+	return out, nil
+}
+
 func printTrialStats(ds []time.Duration) {
 	s := computeDurationStats(ds)
 	if s.Count == 0 {
@@ -1310,19 +1549,29 @@ func waitForStopLeaderEvent(cluster *DemoCluster, timeout time.Duration) (time.D
 
 type TransportFactory struct {
 	DelayMillisecond uint64
+	LatencyModel     *TransportLatencyModel
 }
 
 type Transport struct {
 	raftio.ITransport
 	DelayMillisecond uint64
+	LatencyModel     *TransportLatencyModel
 }
 
 type Connection struct {
 	raftio.IConnection
 	DelayMillisecond uint64
+	LatencyModel     *TransportLatencyModel
 }
 
 func (c Connection) SendMessageBatch(batch raftpb.MessageBatch) error {
+	if c.LatencyModel != nil && c.LatencyModel.Enabled() {
+		if d := c.LatencyModel.SampleOneWayDelay(); d > 0 {
+			time.Sleep(d)
+		}
+		return c.IConnection.SendMessageBatch(batch)
+	}
+
 	// Allow DelayMillisecond=0 (default) and any small values without underflowing
 	// or passing a negative/zero argument to rand.Intn.
 	const minDelay uint64 = 25
@@ -1358,11 +1607,15 @@ func (t Transport) GetConnection(ctx context.Context, target string) (raftio.ICo
 	if err != nil {
 		return nil, err
 	}
-	return &Connection{IConnection: connection, DelayMillisecond: t.DelayMillisecond}, nil
+	return &Connection{IConnection: connection, DelayMillisecond: t.DelayMillisecond, LatencyModel: t.LatencyModel}, nil
 }
 
 func (t TransportFactory) Create(hostConfig config.NodeHostConfig, messageHandler raftio.MessageHandler, chunkHandler raftio.ChunkHandler) raftio.ITransport {
-	return &Transport{ITransport: transport.NewChanTransport(hostConfig, messageHandler, chunkHandler), DelayMillisecond: t.DelayMillisecond}
+	return &Transport{
+		ITransport:       transport.NewChanTransport(hostConfig, messageHandler, chunkHandler),
+		DelayMillisecond: t.DelayMillisecond,
+		LatencyModel:     t.LatencyModel,
+	}
 }
 
 func (t TransportFactory) Validate(s string) bool {

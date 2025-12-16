@@ -27,6 +27,16 @@ go build -o raft-demo .
 | `--auto-workload` | Automatic workload | false |
 | `--duration` | Test duration (sec, 0=interactive) | 0 |
 | `--startup-spread` | **Max random startup delay per node (ms)** | 0 |
+| `--transport-max-delay-ms` | Uniform per-message one-way delay injector (ms). Simple jitter model. | 0 |
+| `--latency-preset` | Transport RTT distribution preset: `global-pessimistic` \| `global-measured` \| `latency-aware` | - |
+| `--latency-values-ms` | Custom RTT samples in ms (comma-separated). Used when no preset. | - |
+| `--latency-weights` | Optional weights (comma-separated, same length as values). | - |
+| `--latency-jitter-ms` | Symmetric RTT jitter (ms) applied to sampled RTT. | 0 |
+| `--latency-spike-ms` | RTT spike value (ms) applied with probability. | 0 |
+| `--latency-spike-prob` | Probability of RTT spike (0..1). | 0 |
+| `--trials` | Run N automated trials and print p50/p90/p99 for initial election and stop-leader re-election | 0 |
+| `--trials-verbose` | Print per-trial results when using `--trials` | false |
+| `--trials-timeout-ms` | Per-phase timeout for trials | 10000 |
 | `--config` | Load config from JSON | - |
 | `--save-config` | Save config to JSON | - |
 
@@ -61,6 +71,18 @@ Node startup delays (simulating block propagation):
 Actual election timeout = ElectionRTT × RTTMillisecond
 Actual heartbeat interval = HeartbeatRTT × RTTMillisecond
 ```
+
+Note: `--rtt` influences **Raft timers**. Network latency is modeled separately via `--transport-max-delay-ms` or the `--latency-*` distribution flags.
+
+## Transport Latency Modeling (RTT distributions)
+
+For globally distributed nodes, a single RTT number is misleading. Use a distribution:
+
+- `--latency-preset=global-pessimistic`: RTT ~200ms baseline, jitter ±30ms, occasional spikes to 350ms.
+- `--latency-preset=global-measured`: sample RTT from `{90,105,150,220,280,350}` with a heavier tail.
+- `--latency-preset=latency-aware`: RTT clustered around 50–90ms.
+
+All `--latency-*` values are interpreted as **RTT in ms**, and the demo applies **one-way delay = RTT/2** on each message send.
 
 ## Interactive Commands
 
