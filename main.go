@@ -72,26 +72,53 @@ type DemoConfig struct {
 	TransportLatencyJitterMs  uint64    `json:"transport_latency_jitter_ms"`
 	TransportLatencySpikeMs   uint64    `json:"transport_latency_spike_ms"`
 	TransportLatencySpikeProb float64   `json:"transport_latency_spike_prob"`
+
+	// Preferred candidate leader election (dragonboat fork PR#1).
+	// When enabled, exactly one node sets config.Config.PreferredCandidate=true,
+	// causing it to campaign immediately during initial bootstrap.
+	PreferredCandidateMode string `json:"preferred_candidate_mode"` // none|random|id
+	PreferredCandidateID   uint64 `json:"preferred_candidate_id"`   // used when mode=id
 }
 
 // DefaultConfig returns sensible default configuration
 func DefaultConfig() DemoConfig {
 	return DemoConfig{
-		NodeCount:          3,
-		ShardID:            1,
-		BasePort:           63000,
-		DataDir:            "/tmp/raft-demo",
-		RTTMillisecond:     100,
-		HeartbeatRTT:       1,
-		ElectionRTT:        10,
-		SnapshotEntries:    100,
-		CompactionOverhead: 50,
-		CheckQuorum:        true,
-		PreVote:            true,
-		Quiesce:            false,
-		ProposalIntervalMs: 500,
-		TestDurationSec:    60,
-		StartupSpreadMs:    0, // 0 = all nodes start simultaneously
+		NodeCount:              3,
+		ShardID:                1,
+		BasePort:               63000,
+		DataDir:                "/tmp/raft-demo",
+		RTTMillisecond:         100,
+		HeartbeatRTT:           1,
+		ElectionRTT:            10,
+		SnapshotEntries:        100,
+		CompactionOverhead:     50,
+		CheckQuorum:            true,
+		PreVote:                true,
+		Quiesce:                false,
+		ProposalIntervalMs:     500,
+		TestDurationSec:        60,
+		StartupSpreadMs:        0, // 0 = all nodes start simultaneously
+		PreferredCandidateMode: "none",
+	}
+}
+
+func choosePreferredCandidate(cfg DemoConfig) (uint64, bool, error) {
+	mode := strings.ToLower(strings.TrimSpace(cfg.PreferredCandidateMode))
+	switch mode {
+	case "", "none", "off", "false":
+		return 0, false, nil
+	case "random":
+		if cfg.NodeCount <= 0 {
+			return 0, false, fmt.Errorf("nodes must be > 0")
+		}
+		return uint64(1 + rand.Intn(cfg.NodeCount)), true, nil
+	case "id":
+		if cfg.PreferredCandidateID < 1 || cfg.PreferredCandidateID > uint64(cfg.NodeCount) {
+			return 0, false, fmt.Errorf("preferred-candidate-id must be in [1,%d]", cfg.NodeCount)
+		}
+		return cfg.PreferredCandidateID, true, nil
+	default:
+		return 0, false, fmt.Errorf("invalid preferred candidate mode %q (expected none|random|id)", cfg.PreferredCandidateMode)
 	}
 }
 
@@ -695,6 +722,11 @@ func (c *DemoCluster) Start() error {
 		return err
 	}
 
+	preferredID, preferredEnabled, err := choosePreferredCandidate(c.config)
+	if err != nil {
+		return err
+	}
+
 	// Build initial members map
 	initialMembers := make(map[uint64]string)
 	for i := 1; i <= c.config.NodeCount; i++ {
@@ -772,6 +804,7 @@ func (c *DemoCluster) Start() error {
 			SnapshotEntries:    c.config.SnapshotEntries,
 			CompactionOverhead: c.config.CompactionOverhead,
 			Quiesce:            c.config.Quiesce,
+			PreferredCandidate: preferredEnabled && replicaID == preferredID,
 		} // Create state machine factory
 		createSM := func(shardID, replicaID uint64) sm.IStateMachine {
 			return NewKVStateMachine(shardID, replicaID)
@@ -1232,6 +1265,8 @@ func main() {
 	trials := flag.Int("trials", 0, "Run N automated trials (start fresh cluster, measure initial election, stop leader, measure stop->new-leader)")
 	trialsVerbose := flag.Bool("trials-verbose", false, "Print per-trial results when using --trials")
 	trialsTimeoutMs := flag.Int("trials-timeout-ms", 10000, "Timeout per trial phase in ms (waiting for leader / waiting for re-election)")
+	preferredCandidate := flag.String("preferred-candidate", "none", "Preferred candidate for initial election (dragonboat fork PR#1): none|random|id")
+	preferredCandidateID := flag.Uint64("preferred-candidate-id", 0, "Preferred candidate replica ID when --preferred-candidate=id")
 
 	flag.Parse()
 
@@ -1269,6 +1304,8 @@ func main() {
 	cfg.TransportLatencyJitterMs = *latencyJitter
 	cfg.TransportLatencySpikeMs = *latencySpikeMs
 	cfg.TransportLatencySpikeProb = *latencySpikeProb
+	cfg.PreferredCandidateMode = *preferredCandidate
+	cfg.PreferredCandidateID = *preferredCandidateID
 
 	// Parse custom RTT distribution values/weights if provided.
 	if strings.TrimSpace(*latencyValues) != "" {
@@ -1372,6 +1409,12 @@ func runTrials(cfg DemoConfig, trials int, verbose bool, phaseTimeout time.Durat
 		trialCfg.TestDurationSec = 0
 		trialCfg.DataDir = filepath.Join(os.TempDir(), fmt.Sprintf("raft-demo-trial-%d-%d", time.Now().UnixNano(), i))
 		trialCfg.BasePort = cfg.BasePort + i*100
+
+		// If preferred-candidate=random, pick a fresh preferred candidate per trial.
+		if strings.ToLower(strings.TrimSpace(trialCfg.PreferredCandidateMode)) == "random" {
+			trialCfg.PreferredCandidateID = uint64(1 + rand.Intn(trialCfg.NodeCount))
+			trialCfg.PreferredCandidateMode = "id"
+		}
 
 		cluster := NewDemoCluster(trialCfg)
 		if err := cluster.Start(); err != nil {

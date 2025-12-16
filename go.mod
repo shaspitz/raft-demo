@@ -7,6 +7,8 @@ require (
 	golang.org/x/sync v0.1.0
 )
 
+replace github.com/lni/dragonboat/v4 => ./_dragonboat_fork
+
 require (
 	github.com/DataDog/zstd v1.4.5 // indirect
 	github.com/HdrHistogram/hdrhistogram-go v1.1.2 // indirect
