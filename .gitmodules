@@ -1,0 +1,4 @@
+[submodule "_dragonboat_fork"]
+	path = _dragonboat_fork
+	url = https://github.com/klim0v/dragonboat.git
+	branch = fork
