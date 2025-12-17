@@ -713,6 +713,50 @@ func NewDemoCluster(cfg DemoConfig) *DemoCluster {
 	}
 }
 
+// ProposeValueWithTimeout submits a proposal and returns how long it took end-to-end.
+// This measures "client-observed commit latency" (including any retries to other nodes).
+func (c *DemoCluster) ProposeValueWithTimeout(value string, timeout time.Duration) (time.Duration, error) {
+	start := time.Now()
+	c.metrics.IncrementProposalsSubmitted()
+
+	deadline := start.Add(timeout)
+	for _, nh := range c.nodes {
+		if nh == nil {
+			continue
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+
+		// Scope context cancellation per attempt, bounded by the remaining budget.
+		err := func() error {
+			ctx, cancel := context.WithTimeout(context.Background(), remaining)
+			defer cancel()
+
+			session := nh.GetNoOPSession(c.config.ShardID)
+			_, err := nh.SyncPropose(ctx, session, []byte(value))
+			return err
+		}()
+
+		if err == nil {
+			c.metrics.IncrementProposalsCompleted()
+			return time.Since(start), nil
+		}
+
+		// Try next node if this one failed in a way that is likely transient.
+		if err == dragonboat.ErrShardNotReady || err == dragonboat.ErrTimeout {
+			continue
+		}
+
+		c.metrics.IncrementProposalsFailed()
+		return time.Since(start), err
+	}
+
+	c.metrics.IncrementProposalsFailed()
+	return time.Since(start), fmt.Errorf("no node available to accept proposal")
+}
+
 func (c *DemoCluster) Start() error {
 	// Clean up previous data
 	os.RemoveAll(c.config.DataDir)
@@ -871,42 +915,8 @@ func (c *DemoCluster) GetLeaderInfo() (uint64, uint64, bool) {
 }
 
 func (c *DemoCluster) ProposeValue(value string) error {
-	c.metrics.IncrementProposalsSubmitted()
-
-	// Find a node to submit proposal
-	for _, nh := range c.nodes {
-		if nh == nil {
-			continue
-		}
-
-		// Use a helper function to properly scope the context cancellation
-		err := func() error {
-			ctx, cancel := context.WithTimeout(context.Background(),
-				time.Duration(c.config.RTTMillisecond*c.config.ElectionRTT)*time.Millisecond)
-			defer cancel()
-
-			session := nh.GetNoOPSession(c.config.ShardID)
-
-			_, err := nh.SyncPropose(ctx, session, []byte(value))
-			return err
-		}()
-
-		if err == nil {
-			c.metrics.IncrementProposalsCompleted()
-			return nil
-		}
-
-		// Try next node if this one failed
-		if err == dragonboat.ErrShardNotReady || err == dragonboat.ErrTimeout {
-			continue
-		}
-
-		c.metrics.IncrementProposalsFailed()
-		return err
-	}
-
-	c.metrics.IncrementProposalsFailed()
-	return fmt.Errorf("no node available to accept proposal")
+	_, err := c.ProposeValueWithTimeout(value, time.Duration(c.config.RTTMillisecond*c.config.ElectionRTT)*time.Millisecond)
+	return err
 }
 
 func (c *DemoCluster) RunWorkload() {
@@ -1044,7 +1054,14 @@ func (c *DemoCluster) RestartNode(nodeID int) error {
 			nodeID:  replicaID,
 		},
 	}
-	nhc.Expert.TransportFactory = &TransportFactory{DelayMillisecond: c.config.TransportMaxDelayMs}
+	latencyModel, err := buildTransportLatencyModel(c.config)
+	if err != nil {
+		return err
+	}
+	nhc.Expert.TransportFactory = &TransportFactory{
+		DelayMillisecond: c.config.TransportMaxDelayMs,
+		LatencyModel:     latencyModel,
+	}
 
 	nh, err := dragonboat.NewNodeHost(nhc)
 	if err != nil {
@@ -1267,6 +1284,9 @@ func main() {
 	trialsTimeoutMs := flag.Int("trials-timeout-ms", 10000, "Timeout per trial phase in ms (waiting for leader / waiting for re-election)")
 	preferredCandidate := flag.String("preferred-candidate", "none", "Preferred candidate for initial election (dragonboat fork PR#1): none|random|id")
 	preferredCandidateID := flag.Uint64("preferred-candidate-id", 0, "Preferred candidate replica ID when --preferred-candidate=id")
+	consensusTrials := flag.Int("consensus-trials", 0, "Run N automated consensus trials and print p50/p90/p99 for proposal commit latency (steady-state and post-failover)")
+	consensusProposals := flag.Int("consensus-proposals", 100, "Number of proposals per phase in consensus trials (steady-state and post-failover)")
+	consensusProposalTimeoutMs := flag.Int("consensus-proposal-timeout-ms", 5000, "Timeout per proposal in consensus trials (ms)")
 
 	flag.Parse()
 
@@ -1346,6 +1366,19 @@ func main() {
 	}
 
 	// Create and start cluster
+	if *consensusTrials > 0 {
+		if err := runConsensusTrials(cfg,
+			*consensusTrials,
+			*trialsVerbose,
+			time.Duration(*trialsTimeoutMs)*time.Millisecond,
+			*consensusProposals,
+			time.Duration(*consensusProposalTimeoutMs)*time.Millisecond,
+		); err != nil {
+			fmt.Printf("Consensus trials failed: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if *trials > 0 {
 		if err := runTrials(cfg, *trials, *trialsVerbose, time.Duration(*trialsTimeoutMs)*time.Millisecond); err != nil {
 			fmt.Printf("Trials failed: %v\n", err)
@@ -1491,6 +1524,151 @@ func runTrials(cfg DemoConfig, trials int, verbose bool, phaseTimeout time.Durat
 	printTrialStats(initialAll)
 	fmt.Println("\nStop-leader re-election (stop leader -> new leader elected):")
 	printTrialStats(stopAll)
+
+	return nil
+}
+
+type proposalBatchResult struct {
+	durations []time.Duration
+	failures  int
+}
+
+func runProposalBatch(cluster *DemoCluster, proposals int, perProposalTimeout time.Duration) proposalBatchResult {
+	if proposals <= 0 {
+		return proposalBatchResult{}
+	}
+	out := proposalBatchResult{
+		durations: make([]time.Duration, 0, proposals),
+	}
+	for i := 0; i < proposals; i++ {
+		v := fmt.Sprintf("trial-proposal-%d-%d", time.Now().UnixNano(), i)
+		d, err := cluster.ProposeValueWithTimeout(v, perProposalTimeout)
+		if err != nil {
+			out.failures++
+			continue
+		}
+		out.durations = append(out.durations, d)
+	}
+	return out
+}
+
+func waitForNewLeader(cluster *DemoCluster, oldLeader uint64, timeout time.Duration) (leaderID uint64, term uint64, ok bool) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		lid, t, ok := cluster.GetLeaderInfo()
+		if ok && lid != 0 && lid != oldLeader {
+			return lid, t, true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return 0, 0, false
+}
+
+func runConsensusTrials(cfg DemoConfig, trials int, verbose bool, phaseTimeout time.Duration, proposalsPerPhase int, perProposalTimeout time.Duration) error {
+	if trials <= 0 {
+		return fmt.Errorf("consensus-trials must be > 0")
+	}
+	if proposalsPerPhase <= 0 {
+		return fmt.Errorf("consensus-proposals must be > 0")
+	}
+	if perProposalTimeout <= 0 {
+		return fmt.Errorf("consensus-proposal-timeout-ms must be > 0")
+	}
+
+	fmt.Printf("\n=== Consensus Trials Mode (%d trials) ===\n", trials)
+	fmt.Printf("Config: nodes=%d rtt=%dms electionRTT=%d heartbeatRTT=%d startupSpread=%dms prevote=%v checkQuorum=%v preferredCandidate=%s\n",
+		cfg.NodeCount, cfg.RTTMillisecond, cfg.ElectionRTT, cfg.HeartbeatRTT, cfg.StartupSpreadMs, cfg.PreVote, cfg.CheckQuorum, cfg.PreferredCandidateMode)
+	fmt.Printf("Leader wait timeout: %v\n", phaseTimeout)
+	fmt.Printf("Proposals per phase: %d, per-proposal timeout: %v\n\n", proposalsPerPhase, perProposalTimeout)
+
+	var steadyAll []time.Duration
+	var postFailoverAll []time.Duration
+	steadyFailures := 0
+	postFailures := 0
+	trialFailures := 0
+
+	for i := 1; i <= trials; i++ {
+		// Isolate each trial so stale state doesn't leak across runs.
+		trialCfg := cfg
+		trialCfg.TestDurationSec = 0
+		trialCfg.DataDir = filepath.Join(os.TempDir(), fmt.Sprintf("raft-demo-consensus-trial-%d-%d", time.Now().UnixNano(), i))
+		trialCfg.BasePort = cfg.BasePort + i*200
+
+		// If preferred-candidate=random, pick a fresh preferred candidate per trial.
+		if strings.ToLower(strings.TrimSpace(trialCfg.PreferredCandidateMode)) == "random" {
+			trialCfg.PreferredCandidateID = uint64(1 + rand.Intn(trialCfg.NodeCount))
+			trialCfg.PreferredCandidateMode = "id"
+		}
+
+		cluster := NewDemoCluster(trialCfg)
+		if err := cluster.Start(); err != nil {
+			trialFailures++
+			if verbose {
+				fmt.Printf("trial %d: start failed: %v\n", i, err)
+			}
+			continue
+		}
+
+		leaderID, leaderTerm, ok := waitForLeader(cluster, phaseTimeout)
+		if !ok {
+			trialFailures++
+			if verbose {
+				fmt.Printf("trial %d: no leader within %v\n", i, phaseTimeout)
+			}
+			cluster.Stop()
+			continue
+		}
+
+		steady := runProposalBatch(cluster, proposalsPerPhase, perProposalTimeout)
+		steadyAll = append(steadyAll, steady.durations...)
+		steadyFailures += steady.failures
+
+		// Force re-election by stopping the current leader.
+		if err := cluster.StopNode(int(leaderID)); err != nil {
+			trialFailures++
+			if verbose {
+				fmt.Printf("trial %d: failed to stop leader %d: %v\n", i, leaderID, err)
+			}
+			cluster.Stop()
+			continue
+		}
+
+		newLeaderID, newLeaderTerm, ok := waitForNewLeader(cluster, leaderID, phaseTimeout)
+		if !ok {
+			trialFailures++
+			if verbose {
+				fmt.Printf("trial %d: no new leader within %v (old leader %d)\n", i, phaseTimeout, leaderID)
+			}
+			cluster.Stop()
+			continue
+		}
+
+		post := runProposalBatch(cluster, proposalsPerPhase, perProposalTimeout)
+		postFailoverAll = append(postFailoverAll, post.durations...)
+		postFailures += post.failures
+
+		if verbose {
+			fmt.Printf("trial %d: leader=%d term=%d steady: ok=%d fail=%d | newLeader=%d term=%d post: ok=%d fail=%d\n",
+				i,
+				leaderID, leaderTerm,
+				len(steady.durations), steady.failures,
+				newLeaderID, newLeaderTerm,
+				len(post.durations), post.failures,
+			)
+		}
+
+		cluster.Stop()
+	}
+
+	fmt.Printf("\n=== Consensus Trial Summary ===\n")
+	fmt.Printf("Completed: %d, trial failures: %d\n", trials-trialFailures, trialFailures)
+	fmt.Printf("\nSteady-state proposal commit latency (SyncPropose end-to-end):\n")
+	printTrialStats(steadyAll)
+	fmt.Printf("  failures=%d (out of %d attempts)\n", steadyFailures, (trials-trialFailures)*proposalsPerPhase)
+
+	fmt.Printf("\nPost-failover proposal commit latency (after stop leader + new leader elected):\n")
+	printTrialStats(postFailoverAll)
+	fmt.Printf("  failures=%d (out of %d attempts)\n", postFailures, (trials-trialFailures)*proposalsPerPhase)
 
 	return nil
 }

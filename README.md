@@ -45,6 +45,9 @@ go build -o raft-demo .
 | `--trials` | Run N automated trials and print p50/p90/p99 for initial election and stop-leader re-election | 0 |
 | `--trials-verbose` | Print per-trial results when using `--trials` | false |
 | `--trials-timeout-ms` | Per-phase timeout for trials | 10000 |
+| `--consensus-trials` | Run N automated **consensus** trials and print p50/p90/p99 for **proposal commit latency** (steady-state and post-failover) | 0 |
+| `--consensus-proposals` | Proposals per phase in consensus trials (steady-state + post-failover) | 100 |
+| `--consensus-proposal-timeout-ms` | Timeout per proposal in consensus trials (ms) | 5000 |
 | `--config` | Load config from JSON | - |
 | `--save-config` | Save config to JSON | - |
 
@@ -153,3 +156,19 @@ Individual election times:
 - `CheckQuorum=true` prevents split-brain scenarios
 - `PreVote=true` reduces unnecessary re-elections
 - For Ethereum-style consensus, set spread to expected block propagation window
+
+## Measuring Consensus (proposal commit latency)
+
+`--consensus-trials` measures end-to-end `SyncPropose` latency (client-observed commit latency) under your transport delay model:
+
+- **steady-state**: after a leader is elected
+- **post-failover**: after force-stopping the leader and waiting for a new leader
+
+Example (10 trials, global-measured transport RTT distribution, preferred-candidate enabled):
+
+```bash
+./raft-demo --nodes=11 --rtt=100 --heartbeat=1 --election=5 --startup-spread=500 \
+  --latency-preset=global-measured \
+  --preferred-candidate=random \
+  --consensus-trials=10 --consensus-proposals=100 --consensus-proposal-timeout-ms=5000
+```
