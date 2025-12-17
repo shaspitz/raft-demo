@@ -40,6 +40,8 @@ go build -o raft-demo .
 | `--latency-jitter-ms` | Symmetric RTT jitter (ms) applied to sampled RTT. | 0 |
 | `--latency-spike-ms` | RTT spike value (ms) applied with probability. | 0 |
 | `--latency-spike-prob` | Probability of RTT spike (0..1). | 0 |
+| `--preferred-candidate` | Preferred candidate for initial election (dragonboat fork PR#1): `none` \| `random` \| `id` | `none` |
+| `--preferred-candidate-id` | Preferred candidate replica ID when `--preferred-candidate=id` | 0 |
 | `--trials` | Run N automated trials and print p50/p90/p99 for initial election and stop-leader re-election | 0 |
 | `--trials-verbose` | Print per-trial results when using `--trials` | false |
 | `--trials-timeout-ms` | Per-phase timeout for trials | 10000 |
