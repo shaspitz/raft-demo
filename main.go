@@ -73,52 +73,31 @@ type DemoConfig struct {
 	TransportLatencySpikeMs   uint64    `json:"transport_latency_spike_ms"`
 	TransportLatencySpikeProb float64   `json:"transport_latency_spike_prob"`
 
-	// Preferred candidate leader election (dragonboat fork PR#1).
-	// When enabled, exactly one node sets config.Config.PreferredCandidate=true,
-	// causing it to campaign immediately during initial bootstrap.
-	PreferredCandidateMode string `json:"preferred_candidate_mode"` // none|random|id
-	PreferredCandidateID   uint64 `json:"preferred_candidate_id"`   // used when mode=id
+	// Forced leader (dragonboat fork PR#2).
+	// When set to a replica ID, all nodes in the shard must agree on this value.
+	// This bypasses normal Raft election during initial bootstrap.
+	ForcedLeaderReplicaID uint64 `json:"forced_leader_replica_id"`
 }
 
 // DefaultConfig returns sensible default configuration
 func DefaultConfig() DemoConfig {
 	return DemoConfig{
-		NodeCount:              3,
-		ShardID:                1,
-		BasePort:               63000,
-		DataDir:                "/tmp/raft-demo",
-		RTTMillisecond:         100,
-		HeartbeatRTT:           1,
-		ElectionRTT:            10,
-		SnapshotEntries:        100,
-		CompactionOverhead:     50,
-		CheckQuorum:            true,
-		PreVote:                true,
-		Quiesce:                false,
-		ProposalIntervalMs:     500,
-		TestDurationSec:        60,
-		StartupSpreadMs:        0, // 0 = all nodes start simultaneously
-		PreferredCandidateMode: "none",
-	}
-}
-
-func choosePreferredCandidate(cfg DemoConfig) (uint64, bool, error) {
-	mode := strings.ToLower(strings.TrimSpace(cfg.PreferredCandidateMode))
-	switch mode {
-	case "", "none", "off", "false":
-		return 0, false, nil
-	case "random":
-		if cfg.NodeCount <= 0 {
-			return 0, false, fmt.Errorf("nodes must be > 0")
-		}
-		return uint64(1 + rand.Intn(cfg.NodeCount)), true, nil
-	case "id":
-		if cfg.PreferredCandidateID < 1 || cfg.PreferredCandidateID > uint64(cfg.NodeCount) {
-			return 0, false, fmt.Errorf("preferred-candidate-id must be in [1,%d]", cfg.NodeCount)
-		}
-		return cfg.PreferredCandidateID, true, nil
-	default:
-		return 0, false, fmt.Errorf("invalid preferred candidate mode %q (expected none|random|id)", cfg.PreferredCandidateMode)
+		NodeCount:             3,
+		ShardID:               1,
+		BasePort:              63000,
+		DataDir:               "/tmp/raft-demo",
+		RTTMillisecond:        100,
+		HeartbeatRTT:          1,
+		ElectionRTT:           10,
+		SnapshotEntries:       100,
+		CompactionOverhead:    50,
+		CheckQuorum:           true,
+		PreVote:               true,
+		Quiesce:               false,
+		ProposalIntervalMs:    500,
+		TestDurationSec:       60,
+		StartupSpreadMs:       0, // 0 = all nodes start simultaneously
+		ForcedLeaderReplicaID: 0,
 	}
 }
 
@@ -766,9 +745,10 @@ func (c *DemoCluster) Start() error {
 		return err
 	}
 
-	preferredID, preferredEnabled, err := choosePreferredCandidate(c.config)
-	if err != nil {
-		return err
+	if c.config.ForcedLeaderReplicaID != 0 {
+		if c.config.ForcedLeaderReplicaID < 1 || c.config.ForcedLeaderReplicaID > uint64(c.config.NodeCount) {
+			return fmt.Errorf("forced-leader-replica-id must be in [1,%d] (or 0 to disable)", c.config.NodeCount)
+		}
 	}
 
 	// Build initial members map
@@ -839,16 +819,16 @@ func (c *DemoCluster) Start() error {
 
 		// Raft node configuration
 		rc := config.Config{
-			ReplicaID:          replicaID,
-			ShardID:            c.config.ShardID,
-			CheckQuorum:        c.config.CheckQuorum,
-			PreVote:            c.config.PreVote,
-			ElectionRTT:        c.config.ElectionRTT,
-			HeartbeatRTT:       c.config.HeartbeatRTT,
-			SnapshotEntries:    c.config.SnapshotEntries,
-			CompactionOverhead: c.config.CompactionOverhead,
-			Quiesce:            c.config.Quiesce,
-			PreferredCandidate: preferredEnabled && replicaID == preferredID,
+			ReplicaID:             replicaID,
+			ShardID:               c.config.ShardID,
+			CheckQuorum:           c.config.CheckQuorum,
+			PreVote:               c.config.PreVote,
+			ElectionRTT:           c.config.ElectionRTT,
+			HeartbeatRTT:          c.config.HeartbeatRTT,
+			SnapshotEntries:       c.config.SnapshotEntries,
+			CompactionOverhead:    c.config.CompactionOverhead,
+			Quiesce:               c.config.Quiesce,
+			ForcedLeaderReplicaID: c.config.ForcedLeaderReplicaID,
 		} // Create state machine factory
 		createSM := func(shardID, replicaID uint64) sm.IStateMachine {
 			return NewKVStateMachine(shardID, replicaID)
@@ -1069,15 +1049,16 @@ func (c *DemoCluster) RestartNode(nodeID int) error {
 	}
 
 	rc := config.Config{
-		ReplicaID:          replicaID,
-		ShardID:            c.config.ShardID,
-		CheckQuorum:        c.config.CheckQuorum,
-		PreVote:            c.config.PreVote,
-		ElectionRTT:        c.config.ElectionRTT,
-		HeartbeatRTT:       c.config.HeartbeatRTT,
-		SnapshotEntries:    c.config.SnapshotEntries,
-		CompactionOverhead: c.config.CompactionOverhead,
-		Quiesce:            c.config.Quiesce,
+		ReplicaID:             replicaID,
+		ShardID:               c.config.ShardID,
+		CheckQuorum:           c.config.CheckQuorum,
+		PreVote:               c.config.PreVote,
+		ElectionRTT:           c.config.ElectionRTT,
+		HeartbeatRTT:          c.config.HeartbeatRTT,
+		SnapshotEntries:       c.config.SnapshotEntries,
+		CompactionOverhead:    c.config.CompactionOverhead,
+		Quiesce:               c.config.Quiesce,
+		ForcedLeaderReplicaID: c.config.ForcedLeaderReplicaID,
 	}
 
 	createSM := func(shardID, replicaID uint64) sm.IStateMachine {
@@ -1282,8 +1263,7 @@ func main() {
 	trials := flag.Int("trials", 0, "Run N automated trials (start fresh cluster, measure initial election, stop leader, measure stop->new-leader)")
 	trialsVerbose := flag.Bool("trials-verbose", false, "Print per-trial results when using --trials")
 	trialsTimeoutMs := flag.Int("trials-timeout-ms", 10000, "Timeout per trial phase in ms (waiting for leader / waiting for re-election)")
-	preferredCandidate := flag.String("preferred-candidate", "none", "Preferred candidate for initial election (dragonboat fork PR#1): none|random|id")
-	preferredCandidateID := flag.Uint64("preferred-candidate-id", 0, "Preferred candidate replica ID when --preferred-candidate=id")
+	forcedLeaderReplicaID := flag.Uint64("forced-leader-replica-id", 0, "Force a specific replica ID to be the initial leader (dragonboat fork PR#2). All nodes must agree on this value. 0 disables.")
 	consensusTrials := flag.Int("consensus-trials", 0, "Run N automated consensus trials and print p50/p90/p99 for proposal commit latency (steady-state and post-failover)")
 	consensusProposals := flag.Int("consensus-proposals", 100, "Number of proposals per phase in consensus trials (steady-state and post-failover)")
 	consensusProposalTimeoutMs := flag.Int("consensus-proposal-timeout-ms", 5000, "Timeout per proposal in consensus trials (ms)")
@@ -1324,8 +1304,7 @@ func main() {
 	cfg.TransportLatencyJitterMs = *latencyJitter
 	cfg.TransportLatencySpikeMs = *latencySpikeMs
 	cfg.TransportLatencySpikeProb = *latencySpikeProb
-	cfg.PreferredCandidateMode = *preferredCandidate
-	cfg.PreferredCandidateID = *preferredCandidateID
+	cfg.ForcedLeaderReplicaID = *forcedLeaderReplicaID
 
 	// Parse custom RTT distribution values/weights if provided.
 	if strings.TrimSpace(*latencyValues) != "" {
@@ -1442,12 +1421,6 @@ func runTrials(cfg DemoConfig, trials int, verbose bool, phaseTimeout time.Durat
 		trialCfg.TestDurationSec = 0
 		trialCfg.DataDir = filepath.Join(os.TempDir(), fmt.Sprintf("raft-demo-trial-%d-%d", time.Now().UnixNano(), i))
 		trialCfg.BasePort = cfg.BasePort + i*100
-
-		// If preferred-candidate=random, pick a fresh preferred candidate per trial.
-		if strings.ToLower(strings.TrimSpace(trialCfg.PreferredCandidateMode)) == "random" {
-			trialCfg.PreferredCandidateID = uint64(1 + rand.Intn(trialCfg.NodeCount))
-			trialCfg.PreferredCandidateMode = "id"
-		}
 
 		cluster := NewDemoCluster(trialCfg)
 		if err := cluster.Start(); err != nil {
@@ -1576,8 +1549,8 @@ func runConsensusTrials(cfg DemoConfig, trials int, verbose bool, phaseTimeout t
 	}
 
 	fmt.Printf("\n=== Consensus Trials Mode (%d trials) ===\n", trials)
-	fmt.Printf("Config: nodes=%d rtt=%dms electionRTT=%d heartbeatRTT=%d startupSpread=%dms prevote=%v checkQuorum=%v preferredCandidate=%s\n",
-		cfg.NodeCount, cfg.RTTMillisecond, cfg.ElectionRTT, cfg.HeartbeatRTT, cfg.StartupSpreadMs, cfg.PreVote, cfg.CheckQuorum, cfg.PreferredCandidateMode)
+	fmt.Printf("Config: nodes=%d rtt=%dms electionRTT=%d heartbeatRTT=%d startupSpread=%dms prevote=%v checkQuorum=%v forcedLeader=%d\n",
+		cfg.NodeCount, cfg.RTTMillisecond, cfg.ElectionRTT, cfg.HeartbeatRTT, cfg.StartupSpreadMs, cfg.PreVote, cfg.CheckQuorum, cfg.ForcedLeaderReplicaID)
 	fmt.Printf("Leader wait timeout: %v\n", phaseTimeout)
 	fmt.Printf("Proposals per phase: %d, per-proposal timeout: %v\n\n", proposalsPerPhase, perProposalTimeout)
 
@@ -1593,12 +1566,6 @@ func runConsensusTrials(cfg DemoConfig, trials int, verbose bool, phaseTimeout t
 		trialCfg.TestDurationSec = 0
 		trialCfg.DataDir = filepath.Join(os.TempDir(), fmt.Sprintf("raft-demo-consensus-trial-%d-%d", time.Now().UnixNano(), i))
 		trialCfg.BasePort = cfg.BasePort + i*200
-
-		// If preferred-candidate=random, pick a fresh preferred candidate per trial.
-		if strings.ToLower(strings.TrimSpace(trialCfg.PreferredCandidateMode)) == "random" {
-			trialCfg.PreferredCandidateID = uint64(1 + rand.Intn(trialCfg.NodeCount))
-			trialCfg.PreferredCandidateMode = "id"
-		}
 
 		cluster := NewDemoCluster(trialCfg)
 		if err := cluster.Start(); err != nil {

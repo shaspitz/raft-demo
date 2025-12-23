@@ -40,8 +40,7 @@ go build -o raft-demo .
 | `--latency-jitter-ms` | Symmetric RTT jitter (ms) applied to sampled RTT. | 0 |
 | `--latency-spike-ms` | RTT spike value (ms) applied with probability. | 0 |
 | `--latency-spike-prob` | Probability of RTT spike (0..1). | 0 |
-| `--preferred-candidate` | Preferred candidate for initial election (dragonboat fork PR#1): `none` \| `random` \| `id` | `none` |
-| `--preferred-candidate-id` | Preferred candidate replica ID when `--preferred-candidate=id` | 0 |
+| `--forced-leader-replica-id` | Force a specific replica ID to be the initial leader (dragonboat fork PR#2). All nodes must agree on this value. `0` disables. | 0 |
 | `--trials` | Run N automated trials and print p50/p90/p99 for initial election and stop-leader re-election | 0 |
 | `--trials-verbose` | Print per-trial results when using `--trials` | false |
 | `--trials-timeout-ms` | Per-phase timeout for trials | 10000 |
@@ -164,11 +163,10 @@ Individual election times:
 - **steady-state**: after a leader is elected
 - **post-failover**: after force-stopping the leader and waiting for a new leader
 
-Example (10 trials, global-measured transport RTT distribution, preferred-candidate enabled):
+Example (10 trials, global-measured transport RTT distribution):
 
 ```bash
 ./raft-demo --nodes=11 --rtt=100 --heartbeat=1 --election=5 --startup-spread=500 \
   --latency-preset=global-measured \
-  --preferred-candidate=random \
   --consensus-trials=10 --consensus-proposals=100 --consensus-proposal-timeout-ms=5000
 ```
